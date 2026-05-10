@@ -1,0 +1,1025 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Serverless Microservices Architecture — API Gateway, Lambda, DynamoDB,
+  EventBridge, SQS, SNS, CloudWatch, IAM (least-privilege per function).
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address for SNS order notifications
+    Default: ops-team@example.com
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DynamoDB
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "OrdersTable-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+        - AttributeName: createdAt
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerOrdersIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SQS Queues + Dead Letter Queues
+# ──────────────────────────────────────────────────────────────────────────────
+
+  NotificationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "NotificationDLQ-${Environment}"
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+  NotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "NotificationQueue-${Environment}"
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+  InventoryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "InventoryDLQ-${Environment}"
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+  InventoryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "InventoryQueue-${Environment}"
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InventoryDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+  ShipmentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "ShipmentDLQ-${Environment}"
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+  ShipmentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "ShipmentQueue-${Environment}"
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ShipmentDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SNS Topic
+# ──────────────────────────────────────────────────────────────────────────────
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "NotificationTopic-${Environment}"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EventBridge Custom Bus
+# ──────────────────────────────────────────────────────────────────────────────
+
+  OrderEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "OrderEventBus-${Environment}"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CloudWatch Log Groups
+# ──────────────────────────────────────────────────────────────────────────────
+
+  CheckoutLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/CheckoutFunction-${Environment}"
+      RetentionInDays: 30
+
+  InventoryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/InventoryFunction-${Environment}"
+      RetentionInDays: 30
+
+  NotificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/NotificationFunction-${Environment}"
+      RetentionInDays: 30
+
+  ShipmentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/ShipmentFunction-${Environment}"
+      RetentionInDays: 30
+
+# ──────────────────────────────────────────────────────────────────────────────
+# IAM Execution Roles (least-privilege)
+# ──────────────────────────────────────────────────────────────────────────────
+
+  CheckoutFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CheckoutFunctionRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CheckoutPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !Sub "${OrdersTable.Arn}/index/CustomerOrdersIndex"
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt OrderEventBus.Arn
+
+  InventoryFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "InventoryFunctionRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InventoryPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !Sub "${OrdersTable.Arn}/index/CustomerOrdersIndex"
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt InventoryQueue.Arn
+
+  NotificationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "NotificationFunctionRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NotificationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt NotificationQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !GetAtt OrdersTable.Arn
+
+  ShipmentFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ShipmentFunctionRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ShipmentPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt OrdersTable.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ShipmentQueue.Arn
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt OrderEventBus.Arn
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lambda Functions
+# ──────────────────────────────────────────────────────────────────────────────
+
+  CheckoutFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CheckoutLogGroup
+    Properties:
+      FunctionName: !Sub "CheckoutFunction-${Environment}"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CheckoutFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          EVENT_BUS_NAME: !Ref OrderEventBus
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import boto3
+          from datetime import datetime, timezone
+
+          dynamodb = boto3.resource("dynamodb")
+          events = boto3.client("events")
+          table = dynamodb.Table(os.environ["ORDERS_TABLE"])
+          event_bus = os.environ["EVENT_BUS_NAME"]
+
+          def handler(event, context):
+              body = json.loads(event.get("body") or "{}")
+              order_id = body.get("orderId") or str(uuid.uuid4())
+              customer_id = body.get("customerId")
+              items = body.get("items", [])
+
+              if not customer_id or not items:
+                  return {"statusCode": 400, "body": json.dumps({"error": "customerId and items are required"})}
+
+              created_at = datetime.now(timezone.utc).isoformat()
+              total = sum(i.get("price", 0) * i.get("quantity", 1) for i in items)
+
+              existing = table.get_item(Key={"orderId": order_id, "createdAt": created_at})
+              if existing.get("Item"):
+                  return {"statusCode": 200, "body": json.dumps({"orderId": order_id, "idempotent": True})}
+
+              table.put_item(Item={
+                  "orderId": order_id, "customerId": customer_id,
+                  "items": items, "total": str(total),
+                  "status": "PENDING", "createdAt": created_at,
+              })
+
+              events.put_events(Entries=[{
+                  "Source": "microservices.checkout",
+                  "DetailType": "OrderPlaced",
+                  "Detail": json.dumps({"orderId": order_id, "customerId": customer_id, "total": total}),
+                  "EventBusName": event_bus,
+              }])
+
+              return {"statusCode": 201, "body": json.dumps({"orderId": order_id, "status": "PENDING", "total": total})}
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+  InventoryFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: InventoryLogGroup
+    Properties:
+      FunctionName: !Sub "InventoryFunction-${Environment}"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt InventoryFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["ORDERS_TABLE"])
+
+          def handler(event, context):
+              results = []
+              for record in event.get("Records", []):
+                  body = json.loads(record["body"])
+                  detail = body.get("detail", body)
+                  order_id = detail.get("orderId")
+                  created_at = detail.get("createdAt")
+
+                  if not order_id:
+                      results.append({"status": "skipped", "reason": "missing orderId"})
+                      continue
+
+                  existing = table.get_item(Key={"orderId": order_id, "createdAt": created_at or ""})
+                  item = existing.get("Item")
+                  if not item:
+                      results.append({"orderId": order_id, "status": "not_found"})
+                      continue
+
+                  if item.get("inventoryReserved"):
+                      results.append({"orderId": order_id, "status": "already_reserved"})
+                      continue
+
+                  table.update_item(
+                      Key={"orderId": order_id, "createdAt": item["createdAt"]},
+                      UpdateExpression="SET #s = :s, inventoryReserved = :r",
+                      ExpressionAttributeNames={"#s": "status"},
+                      ExpressionAttributeValues={":s": "INVENTORY_RESERVED", ":r": True},
+                  )
+                  results.append({"orderId": order_id, "status": "reserved"})
+
+              return {"processed": len(results), "results": results}
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+  NotificationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: NotificationLogGroup
+    Properties:
+      FunctionName: !Sub "NotificationFunction-${Environment}"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt NotificationFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          NOTIFICATION_TOPIC_ARN: !Ref NotificationTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          sns = boto3.client("sns")
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["ORDERS_TABLE"])
+          topic_arn = os.environ["NOTIFICATION_TOPIC_ARN"]
+
+          def handler(event, context):
+              results = []
+              for record in event.get("Records", []):
+                  body = json.loads(record["body"])
+                  detail = body.get("detail", body)
+                  order_id = detail.get("orderId")
+                  event_type = body.get("detail-type", "OrderEvent")
+
+                  if not order_id:
+                      results.append({"status": "skipped"})
+                      continue
+
+                  subject = f"Order Update: {event_type}"
+                  message = json.dumps({
+                      "orderId": order_id,
+                      "eventType": event_type,
+                      "detail": detail,
+                  }, indent=2)
+
+                  resp = sns.publish(TopicArn=topic_arn, Subject=subject, Message=message)
+                  results.append({"orderId": order_id, "messageId": resp["MessageId"]})
+
+              return {"notified": len(results), "results": results}
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+  ShipmentFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ShipmentLogGroup
+    Properties:
+      FunctionName: !Sub "ShipmentFunction-${Environment}"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ShipmentFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          EVENT_BUS_NAME: !Ref OrderEventBus
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import boto3
+
+          dynamodb = boto3.resource("dynamodb")
+          events = boto3.client("events")
+          table = dynamodb.Table(os.environ["ORDERS_TABLE"])
+          event_bus = os.environ["EVENT_BUS_NAME"]
+
+          def handler(event, context):
+              results = []
+              for record in event.get("Records", []):
+                  body = json.loads(record["body"])
+                  detail = body.get("detail", body)
+                  order_id = detail.get("orderId")
+                  created_at = detail.get("createdAt")
+
+                  if not order_id:
+                      results.append({"status": "skipped"})
+                      continue
+
+                  existing = table.get_item(Key={"orderId": order_id, "createdAt": created_at or ""})
+                  item = existing.get("Item")
+                  if not item:
+                      results.append({"orderId": order_id, "status": "not_found"})
+                      continue
+
+                  if item.get("trackingId"):
+                      results.append({"orderId": order_id, "status": "already_shipped", "trackingId": item["trackingId"]})
+                      continue
+
+                  tracking_id = str(uuid.uuid4())
+                  table.update_item(
+                      Key={"orderId": order_id, "createdAt": item["createdAt"]},
+                      UpdateExpression="SET #s = :s, trackingId = :t",
+                      ExpressionAttributeNames={"#s": "status"},
+                      ExpressionAttributeValues={":s": "SHIPPED", ":t": tracking_id},
+                  )
+
+                  events.put_events(Entries=[{
+                      "Source": "microservices.shipment",
+                      "DetailType": "OrderShipped",
+                      "Detail": json.dumps({"orderId": order_id, "trackingId": tracking_id}),
+                      "EventBusName": event_bus,
+                  }])
+
+                  results.append({"orderId": order_id, "status": "shipped", "trackingId": tracking_id})
+
+              return {"processed": len(results), "results": results}
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lambda Permissions for EventBridge
+# ──────────────────────────────────────────────────────────────────────────────
+
+  CheckoutFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CheckoutFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+
+  InventoryFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt InventoryFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+
+  NotificationFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NotificationFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+
+  ShipmentFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ShipmentFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SQS Event Source Mappings
+# ──────────────────────────────────────────────────────────────────────────────
+
+  InventoryEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt InventoryQueue.Arn
+      FunctionName: !GetAtt InventoryFunction.Arn
+      BatchSize: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  NotificationEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt NotificationQueue.Arn
+      FunctionName: !GetAtt NotificationFunction.Arn
+      BatchSize: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  ShipmentEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ShipmentQueue.Arn
+      FunctionName: !GetAtt ShipmentFunction.Arn
+      BatchSize: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EventBridge Rules
+# ──────────────────────────────────────────────────────────────────────────────
+
+  CheckoutEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "CheckoutRule-${Environment}"
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - microservices.checkout
+        detail-type:
+          - OrderPlaced
+      State: ENABLED
+      Targets:
+        - Id: CheckoutTarget
+          Arn: !GetAtt CheckoutFunction.Arn
+
+  InventoryEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "InventoryRule-${Environment}"
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - microservices.checkout
+        detail-type:
+          - OrderPlaced
+      State: ENABLED
+      Targets:
+        - Id: InventoryQueueTarget
+          Arn: !GetAtt InventoryQueue.Arn
+
+  NotificationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "NotificationRule-${Environment}"
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - prefix: microservices.
+        detail-type:
+          - OrderPlaced
+          - OrderShipped
+      State: ENABLED
+      Targets:
+        - Id: NotificationQueueTarget
+          Arn: !GetAtt NotificationQueue.Arn
+
+  ShipmentEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "ShipmentRule-${Environment}"
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - microservices.checkout
+        detail-type:
+          - OrderPlaced
+      State: ENABLED
+      Targets:
+        - Id: ShipmentQueueTarget
+          Arn: !GetAtt ShipmentQueue.Arn
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SQS Queue Policies for EventBridge
+# ──────────────────────────────────────────────────────────────────────────────
+
+  InventoryQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref InventoryQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt InventoryQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt InventoryEventRule.Arn
+
+  NotificationQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref NotificationQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt NotificationQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt NotificationEventRule.Arn
+
+  ShipmentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ShipmentQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ShipmentQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt ShipmentEventRule.Arn
+
+# ──────────────────────────────────────────────────────────────────────────────
+# API Gateway REST API
+# ──────────────────────────────────────────────────────────────────────────────
+
+  OrdersApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "OrdersApi-${Environment}"
+      Description: Serverless Microservices REST API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Project
+          Value: serverless-microservices
+
+  CheckoutResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ParentId: !GetAtt OrdersApi.RootResourceId
+      PathPart: checkout
+
+  InventoryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ParentId: !GetAtt OrdersApi.RootResourceId
+      PathPart: inventory
+
+  NotificationResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ParentId: !GetAtt OrdersApi.RootResourceId
+      PathPart: notification
+
+  ShipmentResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ParentId: !GetAtt OrdersApi.RootResourceId
+      PathPart: shipment
+
+  CheckoutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ResourceId: !Ref CheckoutResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations"
+          - FunctionArn: !GetAtt CheckoutFunction.Arn
+
+  InventoryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ResourceId: !Ref InventoryResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations"
+          - FunctionArn: !GetAtt InventoryFunction.Arn
+
+  NotificationMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ResourceId: !Ref NotificationResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations"
+          - FunctionArn: !GetAtt NotificationFunction.Arn
+
+  ShipmentMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref OrdersApi
+      ResourceId: !Ref ShipmentResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations"
+          - FunctionArn: !GetAtt ShipmentFunction.Arn
+
+  ApiGatewayCheckoutPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CheckoutFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OrdersApi}/*/POST/checkout"
+
+  ApiGatewayInventoryPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt InventoryFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OrdersApi}/*/POST/inventory"
+
+  ApiGatewayNotificationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NotificationFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OrdersApi}/*/POST/notification"
+
+  ApiGatewayShipmentPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ShipmentFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OrdersApi}/*/POST/shipment"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CheckoutMethod
+      - InventoryMethod
+      - NotificationMethod
+      - ShipmentMethod
+    Properties:
+      RestApiId: !Ref OrdersApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref OrdersApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          DataTraceEnabled: false
+          LoggingLevel: ERROR
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CloudWatch Alarms
+# ──────────────────────────────────────────────────────────────────────────────
+
+  CheckoutErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "CheckoutErrors-${Environment}"
+      AlarmDescription: Checkout Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CheckoutFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  InventoryDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "InventoryDLQMessages-${Environment}"
+      AlarmDescription: Messages arriving in Inventory DLQ
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt InventoryDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  NotificationDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "NotificationDLQMessages-${Environment}"
+      AlarmDescription: Messages arriving in Notification DLQ
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt NotificationDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  ShipmentDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "ShipmentDLQMessages-${Environment}"
+      AlarmDescription: Messages arriving in Shipment DLQ
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ShipmentDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NotificationTopic
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ──────────────────────────────────────────────────────────────────────────────
+
+Outputs:
+  ApiGatewayUrl:
+    Description: Base URL of the deployed API
+    Value: !Sub "https://${OrdersApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiGatewayUrl"
+
+  EventBusArn:
+    Description: ARN of the custom EventBridge bus
+    Value: !GetAtt OrderEventBus.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBusArn"
+
+  DynamoDBTableName:
+    Description: Name of the DynamoDB Orders table
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub "${AWS::StackName}-OrdersTableName"
+
+  NotificationTopicArn:
+    Description: ARN of the SNS Notification topic
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-NotificationTopicArn"
+
+  CheckoutFunctionArn:
+    Description: ARN of the Checkout Lambda function
+    Value: !GetAtt CheckoutFunction.Arn
+
+  InventoryFunctionArn:
+    Description: ARN of the Inventory Lambda function
+    Value: !GetAtt InventoryFunction.Arn
+
+  NotificationFunctionArn:
+    Description: ARN of the Notification Lambda function
+    Value: !GetAtt NotificationFunction.Arn
+
+  ShipmentFunctionArn:
+    Description: ARN of the Shipment Lambda function
+    Value: !GetAtt ShipmentFunction.Arn

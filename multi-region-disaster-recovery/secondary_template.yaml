@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DR Secondary Stack — eu-central-1 (Frankfurt).
+  Provisions VPC, EC2, ALB, RDS MySQL read replica, and S3 with versioning.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dr-secondary
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+
+  SourceDBInstanceArn:
+    Type: String
+    Description: ARN of the primary RDS instance to replicate from
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: "10.1.0.0/16"
+    PublicSubnet1:
+      CIDR: "10.1.1.0/24"
+    PublicSubnet2:
+      CIDR: "10.1.2.0/24"
+    PrivateSubnet1:
+      CIDR: "10.1.3.0/24"
+    PrivateSubnet2:
+      CIDR: "10.1.4.0/24"
+
+Resources:
+
+  # ── VPC & Networking ────────────────────────────────────────────────────────
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [SubnetConfig, VPC, CIDR]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-igw"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !FindInMap [SubnetConfig, PublicSubnet1, CIDR]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-subnet-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !FindInMap [SubnetConfig, PublicSubnet2, CIDR]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-subnet-2"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !FindInMap [SubnetConfig, PrivateSubnet1, CIDR]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-subnet-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !FindInMap [SubnetConfig, PrivateSubnet2, CIDR]
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-subnet-2"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-rt"
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # ── Security Groups ──────────────────────────────────────────────────────────
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-web-sg"
+      GroupDescription: Allow HTTP, HTTPS and SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-web-sg"
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-alb-sg"
+      GroupDescription: Allow HTTP and HTTPS inbound to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb-sg"
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-db-sg"
+      GroupDescription: Allow MySQL from web tier
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-db-sg"
+
+  # ── EC2 ─────────────────────────────────────────────────────────────────────
+
+  WebInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y httpd
+          systemctl enable httpd
+          systemctl start httpd
+          echo "<h1>DR Secondary — eu-central-1</h1><p>Instance: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)</p>" \
+            > /var/www/html/index.html
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-web"
+
+  # ── ALB ─────────────────────────────────────────────────────────────────────
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-tg"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Targets:
+        - Id: !Ref WebInstance
+          Port: 80
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ── RDS Read Replica ─────────────────────────────────────────────────────────
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Secondary RDS subnet group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-db-subnet-group"
+
+  RDSReadReplica:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-mysql-replica"
+      DBInstanceClass: db.t3.micro
+      SourceDBInstanceIdentifier: !Ref SourceDBInstanceArn
+      MultiAZ: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      StorageEncrypted: true
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-mysql-replica"
+
+  # ── S3 ──────────────────────────────────────────────────────────────────────
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "dr-secondary-buckets-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: dr-secondary-bucket
+
+Outputs:
+
+  ALBDnsName:
+    Description: DNS name of the secondary Application Load Balancer
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub "${EnvironmentName}-ALBDnsName"
+
+  ALBARN:
+    Description: ARN of the secondary Application Load Balancer
+    Value: !Ref ALB
+    Export:
+      Name: !Sub "${EnvironmentName}-ALBARN"
+
+  RDSEndpoint:
+    Description: Endpoint address of the RDS read replica
+    Value: !GetAtt RDSReadReplica.Endpoint.Address
+    Export:
+      Name: !Sub "${EnvironmentName}-RDSEndpoint"
+
+  S3BucketName:
+    Description: Name of the secondary S3 bucket
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub "${EnvironmentName}-S3BucketName"
+
+  WebInstanceId:
+    Description: Instance ID of the secondary web EC2 instance
+    Value: !Ref WebInstance
+    Export:
+      Name: !Sub "${EnvironmentName}-WebInstanceId"

@@ -1,0 +1,43 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx-ingress
+  namespace: devops
+  labels:
+    app: nginx
+    environment: production
+    managed-by: kubectl
+  annotations:
+    # NGINX Ingress Controller
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    # Rate limiting — protect the backend from traffic spikes.
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: devops.example.com
+      http:
+        paths:
+          # Root path — main application
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nginx-service
+                port:
+                  name: http
+          # /api path — could point to a separate API service in future
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: nginx-service
+                port:
+                  name: http

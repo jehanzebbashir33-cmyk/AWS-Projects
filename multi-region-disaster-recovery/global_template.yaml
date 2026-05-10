@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DR Global Stack — CloudFront distribution with origin group failover,
+  Route 53 health check, and failover DNS records.
+
+Parameters:
+  PrimaryALBDns:
+    Type: String
+    Description: DNS name of the primary ALB (eu-north-1)
+
+  SecondaryALBDns:
+    Type: String
+    Description: DNS name of the secondary ALB (eu-central-1)
+
+  DomainName:
+    Type: String
+    Default: demo.example.com
+    Description: Public domain name for the application
+
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Route 53 hosted zone ID for the domain
+
+Resources:
+
+  # ── CloudFront ───────────────────────────────────────────────────────────────
+
+  CloudFrontOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: dr-alb-origin-request-policy
+        Comment: Forward Host header to ALB origins
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers:
+            - Host
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  CloudFrontCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: dr-no-cache-policy
+        Comment: Bypass cache for dynamic DR traffic
+        DefaultTTL: 0
+        MaxTTL: 1
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "DR distribution — ${DomainName}"
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Aliases:
+          - !Ref DomainName
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: primary-alb-origin
+            DomainName: !Ref PrimaryALBDns
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+          - Id: secondary-alb-origin
+            DomainName: !Ref SecondaryALBDns
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+        OriginGroups:
+          Items:
+            - Id: dr-origin-group
+              FailoverCriteria:
+                StatusCodes:
+                  Items:
+                    - 500
+                    - 502
+                    - 503
+                    - 504
+                  Quantity: 4
+              Members:
+                Items:
+                  - OriginId: primary-alb-origin
+                  - OriginId: secondary-alb-origin
+                Quantity: 2
+          Quantity: 1
+        DefaultCacheBehavior:
+          TargetOriginId: dr-origin-group
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: !Ref CloudFrontCachePolicy
+          OriginRequestPolicyId: !Ref CloudFrontOriginRequestPolicy
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 502
+            ResponsePagePath: /error.html
+            ResponseCode: 502
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 503
+            ResponsePagePath: /error.html
+            ResponseCode: 503
+            ErrorCachingMinTTL: 10
+      Tags:
+        - Key: Name
+          Value: dr-cloudfront-distribution
+
+  # ── Route 53 Health Check ────────────────────────────────────────────────────
+
+  PrimaryHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP
+        FullyQualifiedDomainName: !Ref PrimaryALBDns
+        Port: 80
+        RequestInterval: 30
+        FailureThreshold: 3
+        ResourcePath: /
+        EnableSNI: false
+      HealthCheckTags:
+        - Key: Name
+          Value: dr-primary-health-check
+
+  # ── Route 53 Failover Records ────────────────────────────────────────────────
+
+  PrimaryDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      SetIdentifier: primary
+      Failover: PRIMARY
+      HealthCheckId: !Ref PrimaryHealthCheck
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        EvaluateTargetHealth: false
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  SecondaryDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      SetIdentifier: secondary
+      Failover: SECONDARY
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        EvaluateTargetHealth: false
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt Distribution.DomainName
+    Export:
+      Name: dr-global-CloudFrontDomain
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref Distribution
+    Export:
+      Name: dr-global-CloudFrontDistributionId
+
+  PrimaryHealthCheckId:
+    Description: Route 53 health check ID for the primary region
+    Value: !Ref PrimaryHealthCheck
+    Export:
+      Name: dr-global-PrimaryHealthCheckId
+
+  ApplicationURL:
+    Description: Application URL via Route 53
+    Value: !Sub "http://${DomainName}"
+    Export:
+      Name: dr-global-ApplicationURL

@@ -1,0 +1,870 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Highly Available and Globally Scalable Web Application on AWS.
+  Architecture includes CloudFront, Route53, ALB, Auto Scaling EC2,
+  RDS MySQL Multi-AZ, ElastiCache Redis, WAF, and a VPC spanning two AZs.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging, development]
+    Description: Deployment environment name used for resource tagging.
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, m5.large, m5.xlarge]
+    Description: EC2 instance type for the Auto Scaling Group.
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues: [db.t3.medium, db.t3.large, db.m5.large, db.m5.xlarge]
+    Description: RDS instance class.
+
+  DBName:
+    Type: String
+    Default: appdb
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    Description: MySQL database name.
+
+  DBUsername:
+    Type: String
+    Default: admin
+    NoEcho: true
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    Description: Database master username.
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: "[a-zA-Z0-9!#$%^&*()_+=-]*"
+    Description: Database master password (min 8 characters).
+
+  ASGMinSize:
+    Type: Number
+    Default: 2
+    Description: Minimum number of EC2 instances in the Auto Scaling Group.
+
+  ASGMaxSize:
+    Type: Number
+    Default: 6
+    Description: Maximum number of EC2 instances in the Auto Scaling Group.
+
+  ASGDesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Desired number of EC2 instances at launch.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Latest Amazon Linux 2 AMI fetched via SSM Parameter Store.
+
+  CertificateArn:
+    Type: String
+    Default: arn:aws:acm:us-east-1:123456789012:certificate/EXAMPLE-CERT-ARN-PLACEHOLDER
+    Description: >
+      ACM certificate ARN in us-east-1 for CloudFront HTTPS.
+      Replace with a real certificate ARN before deployment.
+
+  DomainName:
+    Type: String
+    Default: app.example.com
+    Description: Primary domain name for the application (used in Route53 and CloudFront).
+
+  HostedZoneId:
+    Type: String
+    Default: Z1EXAMPLE00000
+    Description: Route53 Hosted Zone ID for the domain. Replace with a real value.
+
+  ElastiCacheNodeType:
+    Type: String
+    Default: cache.t3.micro
+    AllowedValues: [cache.t3.micro, cache.t3.small, cache.t3.medium, cache.m5.large]
+    Description: ElastiCache Redis node type.
+
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: "10.0.0.0/16"
+    PublicSubnetA:
+      CIDR: "10.0.1.0/24"
+    PublicSubnetB:
+      CIDR: "10.0.2.0/24"
+    PrivateSubnetA:
+      CIDR: "10.0.11.0/24"
+    PrivateSubnetB:
+      CIDR: "10.0.12.0/24"
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # VPC and Networking
+  # ---------------------------------------------------------------------------
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [SubnetConfig, VPC, CIDR]
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-igw"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !FindInMap [SubnetConfig, PublicSubnetA, CIDR]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-subnet-a"
+        - Key: Tier
+          Value: Public
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !FindInMap [SubnetConfig, PublicSubnetB, CIDR]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-subnet-b"
+        - Key: Tier
+          Value: Public
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !FindInMap [SubnetConfig, PrivateSubnetA, CIDR]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-subnet-a"
+        - Key: Tier
+          Value: Private
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !FindInMap [SubnetConfig, PrivateSubnetB, CIDR]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-subnet-b"
+        - Key: Tier
+          Value: Private
+
+  NatGatewayEIPA:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-nat-eip-a"
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIPA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-nat-gw-a"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-rt"
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-rt"
+
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGatewayA
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------------------------
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and HTTPS traffic to the Application Load Balancer.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb-sg"
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB only. Allow HTTPS outbound for package installs.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-web-sg"
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL access from web servers only.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-db-sg"
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Redis access from web servers only.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-cache-sg"
+
+  # ---------------------------------------------------------------------------
+  # IAM Role for EC2 Instances
+  # ---------------------------------------------------------------------------
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-ec2-instance-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: S3ReadForDeployment
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${EnvironmentName}-app-artifacts"
+                  - !Sub "arn:aws:s3:::${EnvironmentName}-app-artifacts/*"
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ---------------------------------------------------------------------------
+  # Application Load Balancer
+  # ---------------------------------------------------------------------------
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"
+        - Key: routing.http2.enabled
+          Value: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-tg"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-tg"
+
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ---------------------------------------------------------------------------
+  # Launch Template and Auto Scaling Group
+  # ---------------------------------------------------------------------------
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${EnvironmentName}-launch-template"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        Monitoring:
+          Enabled: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+            yum update -y
+            yum install -y httpd amazon-cloudwatch-agent
+
+            cat > /var/www/html/index.html <<'HTML'
+            <!DOCTYPE html>
+            <html>
+              <head><title>Highly Available Web App</title></head>
+              <body><h1>Highly Available Web Application</h1><p>Served from: $(hostname)</p></body>
+            </html>
+            HTML
+
+            cat > /var/www/html/health <<'HTML'
+            OK
+            HTML
+
+            systemctl enable httpd
+            systemctl start httpd
+
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config -m ec2 -s -c ssm:AmazonCloudWatch-Config || true
+
+  WebServerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - DefaultPrivateRoute
+      - PrivateSubnetARouteTableAssociation
+      - PrivateSubnetBRouteTableAssociation
+    Properties:
+      AutoScalingGroupName: !Sub "${EnvironmentName}-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref ASGMinSize
+      MaxSize: !Ref ASGMaxSize
+      DesiredCapacity: !Ref ASGDesiredCapacity
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-web-server"
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebServerASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0
+
+  # ---------------------------------------------------------------------------
+  # RDS MySQL Multi-AZ
+  # ---------------------------------------------------------------------------
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS across two private AZs.
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-db-subnet-group"
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-mysql"
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      MultiAZ: true
+      StorageType: gp3
+      AllocatedStorage: "20"
+      MaxAllocatedStorage: 100
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "02:00-03:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-rds-mysql"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # ElastiCache Redis
+  # ---------------------------------------------------------------------------
+
+  ElastiCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub "${EnvironmentName}-cache-subnet-group"
+      Description: Subnet group for ElastiCache Redis across two private AZs.
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+  ElastiCacheReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub "${EnvironmentName}-redis"
+      ReplicationGroupDescription: Redis replication group for session and data caching.
+      CacheNodeType: !Ref ElastiCacheNodeType
+      Engine: redis
+      EngineVersion: "7.0"
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroup
+      SnapshotRetentionLimit: 3
+      SnapshotWindow: "03:00-04:00"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-redis"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # AWS WAF WebACL
+  # ---------------------------------------------------------------------------
+
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${EnvironmentName}-web-acl"
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${EnvironmentName}WebACL"
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSet
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputs
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: SQLiRuleSet
+        - Name: RateLimitRule
+          Priority: 4
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimit
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # CloudFront Distribution
+  # ---------------------------------------------------------------------------
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "CloudFront distribution for ${EnvironmentName} web application"
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        WebACLId: !GetAtt WAFWebACL.Arn
+        Aliases:
+          - !Ref DomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: ALBOrigin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Sub "${EnvironmentName}-origin-secret-placeholder"
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+        CacheBehaviors:
+          - PathPattern: /static/*
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          - ErrorCode: 500
+            ResponseCode: 500
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 503
+            ResponseCode: 503
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 10
+        Logging:
+          Bucket: !Sub "${EnvironmentName}-cf-logs.s3.amazonaws.com"
+          IncludeCookies: false
+          Prefix: cloudfront/
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ---------------------------------------------------------------------------
+  # Route53 Health Check and DNS Record
+  # ---------------------------------------------------------------------------
+
+  Route53HealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTPS
+        FullyQualifiedDomainName: !GetAtt ApplicationLoadBalancer.DNSName
+        Port: 443
+        ResourcePath: /health
+        RequestInterval: 30
+        FailureThreshold: 3
+        EnableSNI: true
+        Regions:
+          - eu-west-1
+          - eu-west-2
+          - us-east-1
+      HealthCheckTags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb-health-check"
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  Route53RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${EnvironmentName}-VPCId"
+
+  PublicSubnetAId:
+    Description: Public Subnet A ID
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: !Sub "${EnvironmentName}-PublicSubnetA"
+
+  PublicSubnetBId:
+    Description: Public Subnet B ID
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: !Sub "${EnvironmentName}-PublicSubnetB"
+
+  ALBDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub "${EnvironmentName}-ALBDNSName"
+
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub "${EnvironmentName}-CloudFrontDomain"
+
+  AppDomainName:
+    Description: Primary application domain name
+    Value: !Ref DomainName
+    Export:
+      Name: !Sub "${EnvironmentName}-AppDomain"
+
+  RDSEndpoint:
+    Description: RDS MySQL endpoint address
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${EnvironmentName}-RDSEndpoint"
+
+  RDSPort:
+    Description: RDS MySQL port
+    Value: !GetAtt RDSInstance.Endpoint.Port
+    Export:
+      Name: !Sub "${EnvironmentName}-RDSPort"
+
+  ElastiCachePrimaryEndpoint:
+    Description: ElastiCache Redis primary endpoint address
+    Value: !GetAtt ElastiCacheReplicationGroup.PrimaryEndPoint.Address
+    Export:
+      Name: !Sub "${EnvironmentName}-CachePrimaryEndpoint"
+
+  ElastiCacheReaderEndpoint:
+    Description: ElastiCache Redis reader endpoint address
+    Value: !GetAtt ElastiCacheReplicationGroup.ReaderEndPoint.Address
+    Export:
+      Name: !Sub "${EnvironmentName}-CacheReaderEndpoint"
+
+  AutoScalingGroupName:
+    Description: Auto Scaling Group name
+    Value: !Ref WebServerASG
+    Export:
+      Name: !Sub "${EnvironmentName}-ASGName"
+
+  WAFWebACLArn:
+    Description: WAF WebACL ARN
+    Value: !GetAtt WAFWebACL.Arn
+    Export:
+      Name: !Sub "${EnvironmentName}-WAFWebACLArn"

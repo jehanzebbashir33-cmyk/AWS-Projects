@@ -1,0 +1,5 @@
+AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"
+AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+AWS_REGION = "eu-north-1"
+STACK_NAME = "data-engineering-analytics-platform"
+KINESIS_STREAM_NAME = "de-data-stream"

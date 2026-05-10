@@ -1,0 +1,509 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Data Engineering & Analytics Platform — Kinesis → Firehose → S3 → Glue → Athena
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  BucketSuffix:
+    Type: String
+    Default: "de-platform-001"
+    Description: >
+      Unique suffix appended to every S3 bucket name to guarantee global
+      uniqueness (e.g. an account-id fragment or a short random string).
+    AllowedPattern: "[a-z0-9\\-]+"
+    ConstraintDescription: "Lowercase letters, numbers, and hyphens only."
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # S3 Buckets
+  # =========================================================================
+
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "raw-data-${BucketSuffix}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionRawToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 7
+                StorageClass: STANDARD_IA
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Project
+          Value: DataEngineeringPlatform
+        - Key: Layer
+          Value: Storage-Raw
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "processed-data-${BucketSuffix}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionProcessedToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 60
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 180
+                StorageClass: GLACIER
+            NoncurrentVersionExpirationInDays: 180
+      Tags:
+        - Key: Project
+          Value: DataEngineeringPlatform
+        - Key: Layer
+          Value: Storage-Processed
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "results-athena-output-${BucketSuffix}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAthenaResults
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: DataEngineeringPlatform
+        - Key: Layer
+          Value: Storage-Results
+
+  # =========================================================================
+  # Kinesis Data Stream  (on-demand capacity mode)
+  # =========================================================================
+
+  DataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: de-data-stream
+      StreamModeDetails:
+        StreamMode: ON_DEMAND
+      RetentionPeriodHours: 24
+      Tags:
+        - Key: Project
+          Value: DataEngineeringPlatform
+        - Key: Layer
+          Value: Ingestion
+
+  # =========================================================================
+  # IAM Role — Firehose (Kinesis → S3)
+  # =========================================================================
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "firehose-delivery-role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: FirehoseS3KinesisPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Kinesis source stream
+              - Sid: ReadFromKinesisStream
+                Effect: Allow
+                Action:
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:DescribeStream
+                  - kinesis:ListShards
+                Resource: !GetAtt DataStream.Arn
+              # S3 raw bucket delivery
+              - Sid: WriteToS3RawBucket
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub "${RawDataBucket.Arn}/*"
+              # CloudWatch logs for Firehose error logging
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: DataEngineeringPlatform
+
+  # =========================================================================
+  # Kinesis Firehose Delivery Stream
+  # =========================================================================
+
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - FirehoseDeliveryRole
+      - DataStream
+      - RawDataBucket
+    Properties:
+      DeliveryStreamName: de-firehose-to-s3
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt DataStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt RawDataBucket.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        # Dynamic partitioning by event time
+        Prefix: "data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+        ErrorOutputPrefix: "errors/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/result=!{firehose:error-output-type}/"
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 64
+        CompressionFormat: GZIP
+        DynamicPartitioningConfiguration:
+          Enabled: true
+          RetryOptions:
+            DurationInSeconds: 300
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: AppendDelimiterToRecord
+              Parameters:
+                - ParameterName: Delimiter
+                  ParameterValue: "\\n"
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub "/aws/kinesisfirehose/de-firehose-to-s3"
+          LogStreamName: "S3Delivery"
+      Tags:
+        - Key: Project
+          Value: DataEngineeringPlatform
+        - Key: Layer
+          Value: Streaming
+
+  # =========================================================================
+  # AWS Glue Database
+  # =========================================================================
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: de_project_db
+        Description: "Glue metadata catalog database for the Data Engineering Platform"
+
+  # =========================================================================
+  # IAM Role — Glue Crawler
+  # =========================================================================
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "glue-crawler-role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueCrawlerS3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadRawBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub "${RawDataBucket.Arn}/*"
+              - Sid: ReadProcessedBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !Sub "${ProcessedDataBucket.Arn}/*"
+      Tags:
+        - Key: Project
+          Value: DataEngineeringPlatform
+
+  # =========================================================================
+  # Glue Crawler — targets raw S3 bucket
+  # =========================================================================
+
+  GlueCrawlerRawData:
+    Type: AWS::Glue::Crawler
+    DependsOn:
+      - GlueDatabase
+      - GlueCrawlerRole
+      - RawDataBucket
+    Properties:
+      Name: de-crawler-raw-data
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: de_project_db
+      Description: "Crawls the raw data S3 bucket to infer schema and update the Glue catalog"
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${RawDataBucket}/data/"
+            Exclusions:
+              - "**/_temporary/**"
+              - "**/errors/**"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+      Schedule:
+        # Daily at 02:00 UTC
+        ScheduleExpression: "cron(0 2 * * ? *)"
+      Tags:
+        Project: DataEngineeringPlatform
+        Layer: Metadata
+
+  # =========================================================================
+  # IAM Role — Athena query execution
+  # =========================================================================
+
+  AthenaQueryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "athena-query-role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: athena.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AthenaQueryPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AthenaOperations
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:ListQueryExecutions
+                  - athena:GetWorkGroup
+                Resource: "*"
+              - Sid: GlueCatalogAccess
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                Resource: "*"
+              - Sid: S3ReadRaw
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub "${RawDataBucket.Arn}/*"
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !Sub "${ProcessedDataBucket.Arn}/*"
+              - Sid: S3WriteResults
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  - !GetAtt ResultsBucket.Arn
+                  - !Sub "${ResultsBucket.Arn}/*"
+      Tags:
+        - Key: Project
+          Value: DataEngineeringPlatform
+
+  # =========================================================================
+  # Athena Workgroup
+  # =========================================================================
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    DependsOn: ResultsBucket
+    Properties:
+      Name: de-analytics-workgroup
+      Description: "Athena workgroup for the Data Engineering Analytics Platform"
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${ResultsBucket}/athena-output/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240  # 10 GB safety limit
+      Tags:
+        - Key: Project
+          Value: DataEngineeringPlatform
+        - Key: Layer
+          Value: Query
+
+  # =========================================================================
+  # CloudWatch Alarms — Kinesis Data Stream observability
+  # =========================================================================
+
+  AlarmKinesisIteratorAge:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: DataStream
+    Properties:
+      AlarmName: !Sub "kinesis-iterator-age-high-${AWS::StackName}"
+      AlarmDescription: >
+        Iterator age is growing — consumers may be falling behind producers.
+        Investigate consumer throughput or scale shards.
+      Namespace: AWS/Kinesis
+      MetricName: GetRecords.IteratorAgeMilliseconds
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref DataStream
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 60000       # 60 seconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  AlarmKinesisWriteThrottled:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: DataStream
+    Properties:
+      AlarmName: !Sub "kinesis-write-throttled-${AWS::StackName}"
+      AlarmDescription: >
+        Producers are being throttled on writes. Check stream capacity or
+        implement exponential back-off in the producer.
+      Namespace: AWS/Kinesis
+      MetricName: WriteProvisionedThroughputExceeded
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref DataStream
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  AlarmKinesisReadThrottled:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: DataStream
+    Properties:
+      AlarmName: !Sub "kinesis-read-throttled-${AWS::StackName}"
+      AlarmDescription: >
+        Consumers are being throttled on reads. Review GetRecords call frequency.
+      Namespace: AWS/Kinesis
+      MetricName: ReadProvisionedThroughputExceeded
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref DataStream
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  DataStreamArn:
+    Description: "ARN of the Kinesis Data Stream"
+    Value: !GetAtt DataStream.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DataStreamArn"
+
+  DataStreamName:
+    Description: "Name of the Kinesis Data Stream"
+    Value: !Ref DataStream
+    Export:
+      Name: !Sub "${AWS::StackName}-DataStreamName"
+
+  RawDataBucketName:
+    Description: "Name of the raw data S3 bucket"
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-RawDataBucket"
+
+  ProcessedDataBucketName:
+    Description: "Name of the processed data S3 bucket"
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ProcessedDataBucket"
+
+  ResultsBucketName:
+    Description: "Name of the Athena results S3 bucket"
+    Value: !Ref ResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ResultsBucket"
+
+  GlueDatabaseName:
+    Description: "Name of the Glue metadata database"
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueDatabase"
+
+  AthenaWorkgroupName:
+    Description: "Name of the Athena workgroup"
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaWorkgroup"
+
+  FirehoseDeliveryStreamName:
+    Description: "Name of the Kinesis Firehose delivery stream"
+    Value: !Ref FirehoseDeliveryStream
+    Export:
+      Name: !Sub "${AWS::StackName}-FirehoseDeliveryStream"

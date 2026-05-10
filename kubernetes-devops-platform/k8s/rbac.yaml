@@ -1,0 +1,125 @@
+---
+# ServiceAccount used by the nginx pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nginx-sa
+  namespace: devops
+  labels:
+    app: nginx
+    environment: production
+    managed-by: kubectl
+  annotations:
+    # Opt out of auto-mounting the default service account token;
+    # tokens are mounted explicitly below only where needed.
+    kubernetes.io/enforce-mountable-secrets: "true"
+automountServiceAccountToken: false
+
+---
+# Role — least-privilege permissions for the nginx application.
+# The pods need only to read their own ConfigMap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nginx-role
+  namespace: devops
+  labels:
+    app: nginx
+    environment: production
+    managed-by: kubectl
+rules:
+  # Allow reading the nginx ConfigMap (nginx config, feature flags, etc.)
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["nginx-config"]
+    verbs: ["get", "watch", "list"]
+
+  # Allow reading own pod metadata (useful for graceful shutdown hooks).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+
+---
+# RoleBinding — bind the Role to the ServiceAccount.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nginx-rolebinding
+  namespace: devops
+  labels:
+    app: nginx
+    environment: production
+    managed-by: kubectl
+subjects:
+  - kind: ServiceAccount
+    name: nginx-sa
+    namespace: devops
+roleRef:
+  kind: Role
+  name: nginx-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ClusterRole — read-only access to cluster-level resources the
+# operations team needs for observability (not bound to nginx pods).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: devops-readonly
+  labels:
+    environment: production
+    managed-by: kubectl
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - namespaces
+      - pods
+      - services
+      - endpoints
+      - persistentvolumes
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ServiceAccount for operations / CI tooling.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: devops-ops-sa
+  namespace: devops
+  labels:
+    environment: production
+    managed-by: kubectl
+automountServiceAccountToken: false
+
+---
+# ClusterRoleBinding — grant the ops ServiceAccount read-only cluster view.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: devops-readonly-binding
+  labels:
+    environment: production
+    managed-by: kubectl
+subjects:
+  - kind: ServiceAccount
+    name: devops-ops-sa
+    namespace: devops
+roleRef:
+  kind: ClusterRole
+  name: devops-readonly
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# AWS
+.cdk/
+cdk.out/
+cdk.json
+
+# Terraform
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+*.pem
+*.key
+
+# CloudFormation
+*.packaged.yaml
+cf-templates-*/
